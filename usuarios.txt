@@ -1,0 +1,3 @@
+# Un usuario por linea. Lo que va despues de # se ignora.
+cib7kb9v3scb2sltq6yx6cf17
+usuario_inexistente_prueba_123   # inventado: tiene que salir NO_ENCONTRADO

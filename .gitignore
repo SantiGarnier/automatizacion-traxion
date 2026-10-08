@@ -1,0 +1,4 @@
+.env
+debug/
+resultados.db
+__pycache__/
