@@ -35,6 +35,27 @@ TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "60000"))
 # Tope de la busqueda de cada usuario: si queda en "loading" mas que esto, se registra
 # como TIMEOUT_BUSQUEDA y se sigue con el siguiente de la lista
 TIMEOUT_BUSQUEDA_MS = int(os.getenv("TIMEOUT_BUSQUEDA_MS", "3000"))
+# Al final del lote, reintentar una vez los usuarios que dieron TIMEOUT_BUSQUEDA
+REINTENTAR_TIMEOUTS = _bool("REINTENTAR_TIMEOUTS", True)
+
+# Base PostgreSQL (tabla bot.usuarios_traxion). Si DB_NAME esta vacio, el bot no usa la base
+# y toma los usuarios de --usuario / --archivo / USUARIOS.
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "")
+DB_USER = os.getenv("DB_USER", "")
+DB_PASS = os.getenv("DB_PASS", "")
+# Fallas pasajeras (ERROR / TIMEOUT_BUSQUEDA) aceptadas en corridas sucesivas antes de marcar FAILED
+MAX_INTENTOS = int(os.getenv("MAX_INTENTOS", "3"))
+# Sincronizacion incremental: ademas de las cuentas posteriores a la ultima importada, vuelve a mirar
+# este margen hacia atras (por transacciones que confirman tarde). Las repetidas se ignoran.
+SYNC_MARGEN_MIN = int(os.getenv("SYNC_MARGEN_MIN", "60"))
+
+# Servidor Boss/Worker (servidor.py): punto de entrada HTTP para que otro sistema despierte al Worker
+API_HOST = os.getenv("API_HOST", "127.0.0.1")  # 0.0.0.0 para aceptar llamadas desde otras maquinas
+API_PORT = int(os.getenv("API_PORT", "8080"))
+API_TOKEN = os.getenv("API_TOKEN", "")          # obligatorio: va en el header X-Token de cada llamada
 
 DEBUG_DIR = BASE_DIR / "debug"
+LOG_DIR = BASE_DIR / "logs"
 DB_PATH = BASE_DIR / "resultados.db"

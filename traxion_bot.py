@@ -7,6 +7,7 @@ Flujo (por cada usuario de la lista, con un solo login):
   3. Busca el usuario (si no responde en TIMEOUT_BUSQUEDA_MS, se registra y se sigue)
   4. Aprieta el lapiz naranja de la columna "M"
   5. Setea "Monto credito" = 1 (y guarda solo si GUARDAR=true / --guardar)
+Al final reintenta una vez los TIMEOUT_BUSQUEDA (si REINTENTAR_TIMEOUTS=true).
 
 Cada usuario queda registrado en resultados.db con uno de estos estados:
   OK               se guardo el monto
@@ -36,9 +37,11 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+import psycopg
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout, sync_playwright
 
 import config
+import fuente_db
 
 
 class BotError(Exception):
@@ -61,22 +64,34 @@ class VariasCuentas(BotError):
     estado = "VARIAS_CUENTAS"
 
 
-# Despues de estos errores la pagina puede quedar trabada (overlay de carga, respuesta tardia
-# que llega mas tarde y pisa el body): se descarta la pagina y se vuelve a loguear.
-REQUIERE_RELOGIN = (SinRespuesta, PWTimeout)
+class SesionVencida(BotError):
+    """Despues de un click aparecio la pantalla de login: no se registra, se re-loguea y se reintenta."""
+
+
+# Despues de estos estados la pagina quedo en un lugar conocido (la grilla) y se puede seguir.
+# Con cualquier otro error la pagina puede quedar trabada (overlay de carga, respuesta tardia que
+# pisa el body, pantalla inesperada): se descarta y se vuelve a loguear antes del siguiente usuario.
+ESTADOS_SIN_RELOGIN = ("OK", "SIN_CAMBIOS", "PRUEBA", "NO_ENCONTRADO", "VARIAS_CUENTAS")
 
 
 # --------------------------------------------------------------------------- utils
 
 def log(msg: str) -> None:
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+    linea = f"[{datetime.now():%H:%M:%S}] {msg}"
+    print(linea, flush=True)
+    try:
+        config.LOG_DIR.mkdir(exist_ok=True)
+        with open(config.LOG_DIR / f"bot_{datetime.now():%Y%m%d}.log", "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d} {linea}\n")
+    except OSError:
+        pass  # que un problema con el archivo de log nunca frene el bot
 
 
 _MARCA_ID = "__bot_marca"
 
 
 def click_y_esperar(page: Page, elemento, accion: str, timeout: int | None = None,
-                    error_cls: type[SinRespuesta] = SinRespuesta) -> None:
+                    error_cls: type[SinRespuesta] = SinRespuesta, chequear_sesion: bool = True) -> None:
     """
     Clickea y espera a que la plataforma reemplace la pagina, por evento y no por tiempo:
       1. Antes del click se inserta un <div> marcador dentro del <body>.
@@ -85,6 +100,7 @@ def click_y_esperar(page: Page, elemento, accion: str, timeout: int | None = Non
       3. Apenas el marcador no existe mas, la pagina nueva ya esta en el DOM y se sigue.
     `timeout` es el tope: si se cumple sin respuesta se lanza `error_cls`.
     Por defecto es TIMEOUT_MS (tope de seguridad); la busqueda usa uno corto.
+    Si la pagina nueva es el login, la sesion vencio -> SesionVencida.
     """
     page.evaluate(
         "id => { const d = document.createElement('div'); d.id = id; d.hidden = true; document.body.appendChild(d); }",
@@ -108,8 +124,15 @@ def click_y_esperar(page: Page, elemento, accion: str, timeout: int | None = Non
 
     if respuestas and respuestas[-1].status >= 400:
         raise BotError(f"{accion}: el servidor respondio HTTP {respuestas[-1].status}")
+    if chequear_sesion and es_pantalla_login(page):
+        raise SesionVencida(f"{accion}: la sesion vencio (aparecio el login)")
     # el overlay "Un momento por favor..." (blockUI) se va con el body viejo; por las dudas
     page.locator(".blockUI").first.wait_for(state="detached")
+
+
+def es_pantalla_login(page: Page) -> bool:
+    return bool(page.locator("#usuario").count() and page.locator("#password").count()
+                and page.get_by_role("button", name="Ingresar").count())
 
 
 def guardar_debug(page: Page, etiqueta: str) -> None:
@@ -155,13 +178,27 @@ def a_numero(valor: str) -> float | None:
         return None
 
 
-# --------------------------------------------------------------------------- pasos
+# --------------------------------------------------------------------------- sesion
 
-def nueva_pagina(context: BrowserContext) -> Page:
-    page = context.new_page()
-    # confirm()/alert() de JS: Playwright los cancela por defecto; los aceptamos y los logueamos
-    page.on("dialog", lambda d: (log(f"Dialogo JS: {d.message!r} -> aceptar"), d.accept()))
-    return page
+class Sesion:
+    """La pagina logueada. Se puede descartar y volver a loguear cuando queda en mal estado."""
+
+    def __init__(self, context: BrowserContext):
+        self.context = context
+        self.page: Page | None = None
+        self.sucia = False  # True = la pagina quedo en mal estado; re-loguear antes de seguir
+
+    def iniciar(self) -> None:
+        self.sucia = False
+        if self.page is not None:
+            try:
+                self.page.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.page = self.context.new_page()
+        # confirm()/alert() de JS: Playwright los cancela por defecto; los aceptamos y los logueamos
+        self.page.on("dialog", lambda d: (log(f"Dialogo JS: {d.message!r} -> aceptar"), d.accept()))
+        login(self.page)
 
 
 def login(page: Page) -> None:
@@ -171,7 +208,7 @@ def login(page: Page) -> None:
 
     page.locator("#usuario").fill(config.TRAXION_USER)
     page.locator("#password").fill(config.TRAXION_PASS)
-    click_y_esperar(page, page.get_by_role("button", name="Ingresar"), "Login")
+    click_y_esperar(page, page.get_by_role("button", name="Ingresar"), "Login", chequear_sesion=False)
 
     # La pagina ya cambio: si no esta el menu GESTORES, el login fallo
     if not page.get_by_text("GESTORES", exact=True).count():
@@ -183,7 +220,11 @@ def login(page: Page) -> None:
     log(f"Login OK como '{config.TRAXION_USER}'")
 
 
+# --------------------------------------------------------------------------- pasos
+
 def ir_a_cuentas(page: Page) -> None:
+    if es_pantalla_login(page):
+        raise SesionVencida("La sesion vencio (la pagina muestra el login)")
     # Ojo: PROVEEDORES tambien tiene un submenu "Cuentas"; hay que tomar el de GESTORES
     gestores = page.locator(
         "xpath=//li[contains(@class,'nav-item')][a/span[contains(@class,'title') and normalize-space()='GESTORES']]"
@@ -292,49 +333,110 @@ def setear_monto_credito(page: Page, monto: str, guardar: bool) -> tuple[str, st
     return anterior, nuevo, True
 
 
-def procesar_usuario(page: Page, usuario: str, guardar: bool, lote: str) -> BotError | PWTimeout | None:
-    """Procesa un usuario y SIEMPRE lo registra. Devuelve el error (si hubo) para decidir si re-loguear."""
-    log(f"Usuario '{usuario}'")
+def procesar_usuario(page: Page, usuario: str, guardar: bool, lote: str, intento: int) -> str:
+    """Procesa un usuario y lo registra. Devuelve el estado. SesionVencida se propaga sin registrar."""
+    log(f"Usuario '{usuario}'" + (f" (intento {intento})" if intento > 1 else ""))
     cuenta, anterior, nuevo, guardado = None, None, None, False
     try:
         ir_a_cuentas(page)
         buscar_usuario(page, usuario)
         cuenta = abrir_edicion(page)
         anterior, nuevo, guardado = setear_monto_credito(page, config.MONTO_CREDITO, guardar)
-        estado = "OK" if guardado else ("SIN_CAMBIOS" if anterior == nuevo else "PRUEBA")
-        registrar(lote, usuario, cuenta, anterior, nuevo, guardado, estado, "")
-        log(f"  -> {estado}")
-        return None
+        estado, detalle = ("OK" if guardado else ("SIN_CAMBIOS" if anterior == nuevo else "PRUEBA")), ""
+    except SesionVencida:
+        raise
     except (BotError, PWTimeout) as e:
         estado = getattr(e, "estado", "ERROR")
         detalle = str(e).splitlines()[0][:500]
-        log(f"  -> {estado}: {detalle}")
         if not isinstance(e, NoEncontrado):
             guardar_debug(page, f"{estado}_{usuario}")
-        registrar(lote, usuario, cuenta, anterior, nuevo, guardado, estado, detalle)
-        return e
+    log(f"  -> {estado}" + (f": {detalle}" if detalle else ""))
+    registrar(lote, intento, usuario, cuenta, anterior, nuevo, guardado, estado, detalle)
+    return estado
+
+
+def procesar_lista(sesion: Sesion, usuarios: list[str], guardar: bool, lote: str, intento: int) -> dict[str, str]:
+    """
+    Procesa la lista sin cortarse: cada usuario termina con un estado registrado.
+    - Si la sesion vence, se re-loguea y se reintenta ESE usuario (una vez).
+    - Si un usuario deja la pagina en mal estado, se re-loguea antes del siguiente.
+    - Si no se puede volver a loguear, los restantes quedan como NO_PROCESADO.
+    """
+    resultados: dict[str, str] = {}
+    for i, usuario in enumerate(usuarios):
+        try:
+            if sesion.sucia:
+                log("Pagina anterior en mal estado: nuevo login para seguir")
+                sesion.iniciar()
+            try:
+                estado = procesar_usuario(sesion.page, usuario, guardar, lote, intento)
+            except SesionVencida as e:
+                log(f"  {e}; nuevo login y se reintenta '{usuario}'")
+                sesion.iniciar()
+                try:
+                    estado = procesar_usuario(sesion.page, usuario, guardar, lote, intento)
+                except SesionVencida as e2:
+                    estado = "ERROR"
+                    registrar(lote, intento, usuario, None, None, None, False, estado,
+                              f"La sesion vencio dos veces seguidas: {e2}"[:500])
+            resultados[usuario] = estado
+            if estado not in ESTADOS_SIN_RELOGIN:
+                sesion.sucia = True
+        except (BotError, PWTimeout) as e:  # fallo un login: no se puede seguir
+            quedan = [u for u in usuarios[i:] if u not in resultados]
+            log(f"ERROR: no se pudo volver a loguear ({e}); quedan {len(quedan)} sin procesar")
+            for u in quedan:
+                registrar(lote, intento, u, None, None, None, False, "NO_PROCESADO",
+                          f"Relogin fallido: {e}"[:500])
+                resultados[u] = "NO_PROCESADO"
+            break
+    return resultados
 
 
 # --------------------------------------------------------------------------- resultados
 
-def registrar(lote: str, usuario: str, cuenta: dict | None, anterior, nuevo, guardado: bool,
-              estado: str, detalle: str) -> None:
-    """Deja registro de cada usuario procesado en SQLite (base para exponerlo despues por un endpoint)."""
-    with sqlite3.connect(config.DB_PATH) as db:
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS ejecuciones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fecha TEXT, entorno TEXT, usuario_busqueda TEXT,
-                cuenta_numero TEXT, cuenta_nombre TEXT,
-                monto_anterior TEXT, monto_nuevo TEXT, guardado INTEGER,
-                estado TEXT, detalle TEXT, lote TEXT)"""
-        )
-        # bases creadas con la version anterior no tienen la columna "lote"
-        if "lote" not in {fila[1] for fila in db.execute("PRAGMA table_info(ejecuciones)")}:
-            db.execute("ALTER TABLE ejecuciones ADD COLUMN lote TEXT")
+_COLUMNAS = {
+    "fecha": "TEXT", "entorno": "TEXT", "usuario_busqueda": "TEXT",
+    "cuenta_numero": "TEXT", "cuenta_nombre": "TEXT",
+    "monto_anterior": "TEXT", "monto_nuevo": "TEXT", "guardado": "INTEGER",
+    "estado": "TEXT", "detalle": "TEXT", "lote": "TEXT", "intento": "INTEGER",
+}
+
+
+def _conectar() -> sqlite3.Connection:
+    db = sqlite3.connect(config.DB_PATH)
+    db.execute("CREATE TABLE IF NOT EXISTS ejecuciones (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+    # bases creadas con versiones anteriores pueden no tener todas las columnas
+    existentes = {fila[1] for fila in db.execute("PRAGMA table_info(ejecuciones)")}
+    for nombre, tipo in _COLUMNAS.items():
+        if nombre not in existentes:
+            db.execute(f"ALTER TABLE ejecuciones ADD COLUMN {nombre} {tipo}")
+    return db
+
+
+# True cuando los usuarios vienen de bot.usuarios_traxion: el resultado se guarda tambien ahi
+_USA_DB = False
+
+
+def registrar(lote: str, intento: int, usuario: str, cuenta: dict | None, anterior, nuevo,
+              guardado: bool, estado: str, detalle: str) -> None:
+    """
+    Deja registro de cada usuario procesado:
+      - SQLite local (resultados.db): historial completo de cada intento.
+      - PostgreSQL (bot.usuarios_traxion), si los usuarios vinieron de la base: estado actual.
+    """
+    if _USA_DB:
+        try:
+            fuente_db.actualizar(usuario, estado, detalle, (cuenta or {}).get("numero"), anterior)
+        except psycopg.Error as e:
+            # No se corta el lote: queda en SQLite y, como en la base sigue pendiente,
+            # la proxima corrida lo vuelve a procesar (el bot es idempotente: SIN_CAMBIOS).
+            log(f"  AVISO: no se pudo actualizar '{usuario}' en la base: {e}")
+    with _conectar() as db:
         db.execute(
             "INSERT INTO ejecuciones (fecha, entorno, usuario_busqueda, cuenta_numero, cuenta_nombre,"
-            " monto_anterior, monto_nuevo, guardado, estado, detalle, lote) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " monto_anterior, monto_nuevo, guardado, estado, detalle, lote, intento)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 datetime.now().isoformat(timespec="seconds"),
                 config.TRAXION_URL,
@@ -347,8 +449,24 @@ def registrar(lote: str, usuario: str, cuenta: dict | None, anterior, nuevo, gua
                 estado,
                 detalle,
                 lote,
+                intento,
             ),
         )
+
+
+def resumen(lote: str) -> None:
+    """Estado FINAL de cada usuario del lote (si se reintento, cuenta el ultimo intento)."""
+    with _conectar() as db:
+        filas = db.execute(
+            "SELECT usuario_busqueda, estado FROM ejecuciones WHERE id IN"
+            " (SELECT MAX(id) FROM ejecuciones WHERE lote = ? GROUP BY usuario_busqueda) ORDER BY id",
+            (lote,),
+        ).fetchall()
+    conteo = Counter(estado for _, estado in filas)
+    log(f"Resumen lote {lote}: " + ", ".join(f"{k}={v}" for k, v in conteo.most_common()))
+    for usuario, estado in filas:
+        if estado not in ("OK", "SIN_CAMBIOS", "PRUEBA"):
+            log(f"  {estado:<16} {usuario}")
 
 
 def cargar_usuarios(args) -> list[str]:
@@ -374,73 +492,115 @@ def main() -> int:
     ap.add_argument("--guardar", action="store_true", help="Aprieta Aceptar (si no, modo prueba)")
     ap.add_argument("--headless", action="store_true", help="Sin ventana de navegador")
     ap.add_argument("--pausa", action="store_true", help="Abre el Playwright Inspector al final")
+    ap.add_argument("--limite", type=int, help="Procesar como maximo N usuarios (util para probar)")
     args = ap.parse_args()
-
-    guardar = args.guardar or config.GUARDAR
-    headless = args.headless or config.HEADLESS
 
     if not config.TRAXION_USER or not config.TRAXION_PASS:
         log(f"ERROR: Faltan TRAXION_USER / TRAXION_PASS en {config.BASE_DIR / '.env'}")
         return 1
+    guardar = args.guardar or config.GUARDAR
+    headless = args.headless or config.HEADLESS
+    if args.solo_login:
+        try:
+            correr_lote([], guardar, headless, solo_login=True, pausa=args.pausa)
+            return 0
+        except (BotError, PWTimeout):
+            return 1
 
-    usuarios = [] if args.solo_login else cargar_usuarios(args)
+    # De donde salen los usuarios: --usuario/--archivo (pruebas, no toca la base) > base PostgreSQL > .env
+    global _USA_DB
+    if args.usuario or args.archivo or not config.DB_NAME:
+        usuarios = cargar_usuarios(args)[:args.limite]
+    else:
+        _USA_DB = True
+        try:
+            sincronizadas = fuente_db.sincronizar()
+            usuarios = fuente_db.pendientes(args.limite)
+        except psycopg.Error as e:
+            log(f"ERROR con la base '{config.DB_NAME}' en {config.DB_HOST}:{config.DB_PORT}: {e}")
+            fuente_db.BaseDatos().cerrar()
+            return 1
+        log(f"Base '{config.DB_NAME}': {sincronizadas} cuenta(s) nueva(s) importada(s) de linked_accounts, "
+            f"{len(usuarios)} pendiente(s) para procesar")
+
+    try:
+        if not usuarios:
+            log("No hay usuarios para procesar")
+            return 0
+        correr_lote(usuarios, guardar, headless, pausa=args.pausa)
+        return 0
+    except (BotError, PWTimeout):
+        return 1  # fallo el login: ya quedo logueado y con captura en debug/
+    finally:
+        fuente_db.BaseDatos().cerrar()
+
+
+def vaciar_cola(guardar: bool, headless: bool) -> Counter:
+    """
+    Procesa la base hasta que no quedan pendientes (lo usa el servidor al "despertar").
+    En cada vuelta re-sincroniza, asi tambien toma las cuentas que se vincularon mientras trabajaba.
+    Cada cuenta se procesa como maximo una vez por llamada: las que quedan pendientes por una falla
+    pasajera esperan al proximo despertar (asi no se queda en loop contra una plataforma caida).
+    Devuelve cuantas cuentas terminaron en cada resultado.
+    """
+    global _USA_DB
+    _USA_DB = True
+    vistas: set[str] = set()
+    conteo: Counter = Counter()
+    try:
+        while True:
+            nuevas = fuente_db.sincronizar()
+            cola = [u for u in fuente_db.pendientes() if u not in vistas]
+            log(f"Base '{config.DB_NAME}': {nuevas} cuenta(s) nueva(s) importada(s), {len(cola)} para procesar")
+            if not cola:
+                return conteo
+            vistas.update(cola)
+            conteo.update(correr_lote(cola, guardar, headless).values())
+    finally:
+        fuente_db.BaseDatos().cerrar()
+
+
+def correr_lote(usuarios: list[str], guardar: bool, headless: bool,
+                solo_login: bool = False, pausa: bool = False) -> dict[str, str]:
+    """
+    Abre el navegador, se loguea y procesa la lista. Devuelve el resultado final de cada usuario.
+    Si no puede loguearse lanza BotError/PWTimeout (con captura en debug/).
+    """
     lote = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=0 if headless else 150)
         context = browser.new_context(viewport={"width": 1600, "height": 1000}, locale="es-AR")
         context.set_default_timeout(config.TIMEOUT_MS)
-        page = nueva_pagina(context)
+        sesion = Sesion(context)
         try:
             try:
-                login(page)
+                sesion.iniciar()
             except (BotError, PWTimeout) as e:
                 log(f"ERROR en login: {e}")
-                guardar_debug(page, "login_error")
-                return 1
-            if args.solo_login:
-                guardar_debug(page, "login_ok")
-                return 0
+                if sesion.page is not None:
+                    guardar_debug(sesion.page, "login_error")
+                raise
+            if solo_login:
+                guardar_debug(sesion.page, "login_ok")
+                return {}
 
             log(f"Lote {lote}: {len(usuarios)} usuario(s), guardar={guardar}, "
                 f"tope busqueda={config.TIMEOUT_BUSQUEDA_MS / 1000:g} s")
-            for i, usuario in enumerate(usuarios):
-                error = procesar_usuario(page, usuario, guardar, lote)
+            resultados = procesar_lista(sesion, usuarios, guardar, lote, intento=1)
 
-                quedan = usuarios[i + 1:]
-                if isinstance(error, REQUIERE_RELOGIN) and quedan:
-                    # La pagina puede seguir en "loading" o recibir tarde la respuesta vieja:
-                    # se tira y se arranca limpia con un login nuevo.
-                    log("  Pagina descartada por falta de respuesta; nuevo login para seguir")
-                    page.close()
-                    page = nueva_pagina(context)
-                    try:
-                        login(page)
-                    except (BotError, PWTimeout) as e:
-                        log(f"ERROR: no se pudo volver a loguear ({e}); se cortan los {len(quedan)} restantes")
-                        for u in quedan:
-                            registrar(lote, u, None, None, None, False, "NO_PROCESADO", f"Relogin fallido: {e}"[:500])
-                        break
+            timeouts = [u for u, e in resultados.items() if e == "TIMEOUT_BUSQUEDA"]
+            if timeouts and config.REINTENTAR_TIMEOUTS and "NO_PROCESADO" not in resultados.values():
+                log(f"Reintentando {len(timeouts)} usuario(s) que dieron TIMEOUT_BUSQUEDA")
+                resultados.update(procesar_lista(sesion, timeouts, guardar, lote, intento=2))
         finally:
-            if args.pausa:
-                page.pause()
+            if pausa and sesion.page is not None:
+                sesion.page.pause()
             context.close()
             browser.close()
 
     resumen(lote)
-    return 0
-
-
-def resumen(lote: str) -> None:
-    with sqlite3.connect(config.DB_PATH) as db:
-        filas = db.execute(
-            "SELECT usuario_busqueda, estado FROM ejecuciones WHERE lote = ? ORDER BY id", (lote,)
-        ).fetchall()
-    conteo = Counter(estado for _, estado in filas)
-    log("Resumen: " + ", ".join(f"{k}={v}" for k, v in conteo.most_common()))
-    for usuario, estado in filas:
-        if estado not in ("OK", "SIN_CAMBIOS", "PRUEBA"):
-            log(f"  {estado:<16} {usuario}")
+    return resultados
 
 
 if __name__ == "__main__":
