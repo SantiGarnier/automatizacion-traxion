@@ -24,7 +24,7 @@ TRAXION_PASS = os.getenv("TRAXION_PASS", "")
 USUARIO_BUSQUEDA = os.getenv("USUARIO_BUSQUEDA", "cib7kb9v3scb2sltq6yx6cf17")
 # Lista separada por comas; si esta vacia se usa USUARIO_BUSQUEDA
 USUARIOS = [u.strip() for u in os.getenv("USUARIOS", "").split(",") if u.strip()]
-MONTO_CREDITO = os.getenv("MONTO_CREDITO", "1")
+# El valor de "Monto credito" NO se configura: es una constante en traxion_bot.py (MONTO_CREDITO).
 
 HEADLESS = _bool("HEADLESS", False)
 # Si GUARDAR=false el bot llega hasta cargar el monto pero NO aprieta Guardar
@@ -45,17 +45,30 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "")
 DB_USER = os.getenv("DB_USER", "")
 DB_PASS = os.getenv("DB_PASS", "")
+# Cifrado de la conexion (TLS). Vacio = automatico: "verify-full" si la base esta en otro host (cifra y
+# comprueba el certificado del servidor) y "prefer" en localhost. Fuera de localhost el bot se niega a
+# arrancar con un modo que permita ir sin cifrar (disable / allow / prefer).
+DB_SSLMODE = os.getenv("DB_SSLMODE", "").strip()
+# Certificado raiz para verify-full (en AWS RDS: el global-bundle.pem que publica Amazon)
+DB_SSLROOTCERT = os.getenv("DB_SSLROOTCERT", "").strip()
 # Fallas pasajeras (ERROR / TIMEOUT_BUSQUEDA) aceptadas en corridas sucesivas antes de marcar FAILED
 MAX_INTENTOS = int(os.getenv("MAX_INTENTOS", "3"))
 # Sincronizacion incremental: ademas de las cuentas posteriores a la ultima importada, vuelve a mirar
 # este margen hacia atras (por transacciones que confirman tarde). Las repetidas se ignoran.
 SYNC_MARGEN_MIN = int(os.getenv("SYNC_MARGEN_MIN", "60"))
+# Cada cuenta se reserva antes de procesarla; si el proceso muere con una reservada, la reserva
+# vence a los RECLAMO_VENCE_MIN minutos y otra corrida la puede tomar.
+RECLAMO_VENCE_MIN = int(os.getenv("RECLAMO_VENCE_MIN", "30"))
 
 # Servidor Boss/Worker (servidor.py): punto de entrada HTTP para que otro sistema despierte al Worker
 API_HOST = os.getenv("API_HOST", "127.0.0.1")  # 0.0.0.0 para aceptar llamadas desde otras maquinas
 API_PORT = int(os.getenv("API_PORT", "8080"))
 API_TOKEN = os.getenv("API_TOKEN", "")          # obligatorio: va en el header X-Token de cada llamada
 
+# Debug: ante un error se guarda una captura. El HTML de la pagina solo con DEBUG_HTML=true (para
+# desarrollar; igual se guarda con la sesion tapada). Todo lo de debug/ se borra a los N dias.
+DEBUG_HTML = _bool("DEBUG_HTML", False)
+DEBUG_RETENCION_DIAS = int(os.getenv("DEBUG_RETENCION_DIAS", "7"))
+
 DEBUG_DIR = BASE_DIR / "debug"
 LOG_DIR = BASE_DIR / "logs"
-DB_PATH = BASE_DIR / "resultados.db"

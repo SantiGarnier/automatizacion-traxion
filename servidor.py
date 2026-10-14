@@ -60,6 +60,8 @@ class Boss:
     """
     Despierta al Worker y lo manda a dormir. Hay un solo Worker trabajando a la vez:
     los avisos que llegan mientras trabaja no arrancan otro, se convierten en una vuelta mas.
+    El threading.Lock de aca coordina los hilos de ESTE proceso. Entre procesos distintos
+    (otro servidor, un cron) coordina el candado de PostgreSQL que toma vaciar_cola().
     """
 
     def __init__(self, worker):
@@ -88,7 +90,7 @@ class Boss:
             try:
                 vuelta["resultados"] = self._worker.trabajar()
                 vuelta["ok"] = True
-            except psycopg.Error as e:  # problema de base: alcanza con el mensaje, sin traceback
+            except (psycopg.Error, fuente_db.CandadoPerdido) as e:  # problema de base: alcanza con el mensaje
                 log(f"Boss: el Worker fallo por la base de datos: {str(e).splitlines()[0]}")
                 vuelta.update(ok=False, error=str(e).splitlines()[0][:500])
             except Exception as e:  # noqa: BLE001 - el Boss nunca se tiene que caer
@@ -102,7 +104,10 @@ class Boss:
                     log("Boss: llegaron avisos mientras trabajaba, el Worker da una vuelta mas")
                     continue
                 self.despierto = False
-                log("Boss: no quedan pendientes, mando a dormir al Worker")
+                if vuelta["ok"]:
+                    log("Boss: no quedan pendientes, mando a dormir al Worker")
+                else:
+                    log("Boss: la vuelta fallo, mando a dormir al Worker hasta el proximo aviso")
                 return
 
     def estado(self) -> dict:
@@ -158,6 +163,7 @@ def main() -> int:
     if len(config.API_TOKEN) < 16:
         log("ERROR: API_TOKEN es muy corto (minimo 16 caracteres)")
         return 1
+    traxion_bot.avisar_config_obsoleta()
     # Probar la base al arrancar: mejor enterarse ahora que cuando lo despierten
     try:
         fuente_db.BaseDatos().conexion()

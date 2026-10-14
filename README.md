@@ -1,12 +1,14 @@
 # Automatización Traxion – Monto crédito
 
-Bot en Python + [Playwright](https://playwright.dev/python/) que entra a la plataforma **Traxion (Pago24)** y, para cada usuario de una lista:
+Bot en Python + [Playwright](https://playwright.dev/python/) que entra a la plataforma **Traxion (Pago24)** y, para cada cuenta de Pago24 Red vinculada a Traxion:
 
 1. Va a **GESTORES → Cuentas → pestaña Usuario** y busca el usuario.
-2. Abre la cuenta con el lápiz de la columna **M** (Modificar).
-3. Setea **Monto crédito = 1** y aprieta **Aceptar** (solo si `GUARDAR=true`).
+2. **Verifica que la cuenta sea la del usuario** (filtro exacto, "ID Usuario" en la pantalla de usuarios de la cuenta y número de cuenta en el formulario). Si algo no coincide, no toca nada.
+3. Abre la cuenta con el lápiz de la columna **M** (Modificar).
+4. Setea **Monto crédito = 1** y aprieta **Aceptar** (solo si `GUARDAR=true`).
+5. Al terminar, **cierra la sesión** en Traxion.
 
-Cada usuario queda registrado en `resultados.db` (SQLite) con su estado, aunque no exista o la plataforma no responda. El bot nunca se queda trabado en un usuario: lo registra y sigue con el siguiente.
+El resultado de cada cuenta queda en PostgreSQL (`bot.usuarios_traxion`), la única fuente de verdad, aunque el usuario no exista o la plataforma no responda; el detalle de cada intento queda además en el log del día. El bot nunca se queda trabado en una cuenta: la registra y sigue con la siguiente.
 
 ---
 
@@ -58,7 +60,6 @@ copy .env.example .env      # Windows
 | `TRAXION_USER` / `TRAXION_PASS` | — | Credenciales de la plataforma |
 | `USUARIOS` | vacío | Lista de usuarios separada por comas |
 | `USUARIO_BUSQUEDA` | — | Usuario único, si `USUARIOS` está vacío |
-| `MONTO_CREDITO` | `1` | Valor a cargar en "Monto crédito" |
 | `GUARDAR` | `false` | `false` = carga el monto pero **no** aprieta Aceptar (modo prueba) |
 | `HEADLESS` | `false` | `true` = sin ventana de navegador (**usar `true` en el servidor**) |
 | `TIMEOUT_BUSQUEDA_MS` | `3000` | Si la búsqueda de un usuario no responde en este tiempo, se registra `TIMEOUT_BUSQUEDA` y se sigue |
@@ -67,14 +68,21 @@ copy .env.example .env      # Windows
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | Servidor PostgreSQL |
 | `DB_NAME` | vacío | Base de la aplicación. Si queda vacío, el bot no usa la base. Con espacios, entre comillas: `DB_NAME="Pago24 Red"` |
 | `DB_USER` / `DB_PASS` | — | Usuario de la base (ver `sql/02_usuario_bot.sql`) |
+| `DB_SSLMODE` | automático | `verify-full` si la base es remota, `prefer` en localhost. Fuera de localhost no se acepta `disable`/`allow`/`prefer` |
+| `DB_SSLROOTCERT` | — | Certificado raíz para `verify-full` (en AWS RDS: `global-bundle.pem`) |
+| `DEBUG_HTML` | `false` | `true` guarda también el HTML de la página ante un error (con la sesión tapada). Solo para desarrollar |
+| `DEBUG_RETENCION_DIAS` | `7` | Lo de `debug/` se borra solo después de N días |
 | `MAX_INTENTOS` | `3` | Fallas pasajeras (`ERROR`, `TIMEOUT_BUSQUEDA`) que se aceptan en corridas sucesivas antes de marcar la cuenta `FAILED` |
 | `SYNC_MARGEN_MIN` | `60` | Margen hacia atrás de la sincronización incremental, en minutos |
+| `RECLAMO_VENCE_MIN` | `30` | Si un proceso muere con una cuenta reservada, la reserva vence a los N minutos |
+
+El valor de "Monto crédito" **no se configura**: el bot siempre pone **1** (constante `MONTO_CREDITO` en `traxion_bot.py`). Aunque Traxion lo llama "monto", en la práctica es un ON/OFF, y un valor configurable solo agregaría la posibilidad de aplicar un número equivocado a todas las cuentas. Si un `.env` viejo todavía tiene `MONTO_CREDITO`, el bot lo ignora y lo avisa en el log.
 
 ## Base de datos
 
 Los usuarios a procesar salen de la tabla de la aplicación **`public.linked_accounts`**, en las filas con `provider = 'traxion'`. El usuario que se busca en Traxion es la columna **`external_user_id`**.
 
-El bot **nunca modifica las tablas de la aplicación**. Trabaja sobre su propia tabla **`bot.usuarios_traxion`**, en un esquema aparte. Esa tabla funciona como el "flag de procesamiento" de cada cuenta y tiene una **FK** a `linked_accounts.id`:
+El bot **nunca modifica las tablas de la aplicación**. De `public.linked_accounts` lee solo **5 columnas** (`id`, `provider`, `status`, `external_user_id`, `created_at`) y **no lee `public.users`**. Trabaja sobre su propia tabla **`bot.usuarios_traxion`**, en un esquema aparte. Esa tabla funciona como el "flag de procesamiento" de cada cuenta y tiene una **FK** a `linked_accounts.id`, que es también su clave: cada vínculo es una fila con su propio resultado (`external_user_id` no es único; dos vínculos pueden apuntar al mismo usuario de Traxion).
 
 | `status` | Significado |
 |---|---|
@@ -97,7 +105,7 @@ También guarda `intentos`, `cuenta_numero`, `monto_anterior` y `procesado_en`.
 
 Si la app borra un vínculo, su fila del bot se borra sola (`ON DELETE CASCADE`).
 
-Para consultar todo junto, con el comercio y el estado del vínculo, está la vista **`bot.v_usuarios_traxion`**:
+Para consultar todo junto, con el comercio y el estado del vínculo, está la vista **`bot.v_usuarios_traxion`**. Es para **consulta humana** (DBeaver): lee `public.users`, por eso no se le da acceso al usuario del bot.
 
 ```sql
 SELECT * FROM bot.v_usuarios_traxion ORDER BY procesado_en DESC NULLS LAST;
@@ -109,13 +117,22 @@ SELECT usuario_traxion, comercio, status_message FROM bot.v_usuarios_traxion WHE
 Para forzar que una cuenta se vuelva a procesar:
 
 ```sql
-UPDATE bot.usuarios_traxion SET status = NULL, status_message = NULL, intentos = 0 WHERE usuario_traxion = '...';
+UPDATE bot.usuarios_traxion SET status = NULL, status_message = NULL, intentos = 0 WHERE linked_account_id = '...';
 ```
+
+### Varios procesos a la vez
+
+Es seguro tener corriendo el servidor y un cron (o dos servidores) contra la misma base. Hay dos protecciones:
+
+1. **Candado por corrida** (`pg_try_advisory_lock`, clave `900001`): al arrancar, cada corrida lo pide. Si otra lo tiene, sale enseguida con `Otra corrida del bot esta en curso` y no toca nada; la que trabaja re-sincroniza al terminar y toma lo nuevo. Está atado a la conexión: si el proceso muere, PostgreSQL lo libera solo. Si la conexión se cae, al reconectar el bot lo vuelve a pedir, y si otra corrida lo tomó mientras tanto, corta la vuelta.
+2. **Reserva por fila** (`reclamado_en`, `reclamado_por`): antes de abrir una cuenta en Traxion, el bot la reserva con un `UPDATE` atómico. Si otro proceso la tiene, la saltea (resultado `OTRO_PROCESO`, no se registra). La reserva se libera al guardar el resultado y vence sola a los `RECLAMO_VENCE_MIN` minutos si el proceso murió con la cuenta reservada.
+
+Cualquier corrida con base configurada toma el candado, incluso una prueba manual con `--usuario`: así nunca hay dos navegadores operando Traxion con el mismo usuario operador.
 
 Puesta en marcha en una base nueva (la corre un administrador):
 
-1. `sql/01_bot_usuarios_traxion.sql`: crea el esquema `bot`, la tabla y hace la primera sincronización.
-2. `sql/02_usuario_bot.sql`: crea el usuario `traxion_bot`, con lectura sobre las tablas de la aplicación y escritura solo sobre su tabla.
+1. `sql/01_bot_usuarios_traxion.sql`: crea el esquema `bot`, la tabla y hace la primera sincronización. Correrlo de nuevo actualiza una tabla de una versión anterior (agrega las columnas que falten).
+2. `sql/02_usuario_bot.sql`: crea el usuario `traxion_bot` con **permisos mínimos**: lectura de **solo las 5 columnas** que usa de `linked_accounts`, **ningún acceso** a `public.users` ni a la vista, y escritura solo sobre su tabla. Cualquier otra columna o tabla la rechaza la propia base.
 
 ## Uso
 
@@ -141,37 +158,36 @@ El código de salida es `0` si el lote terminó (aunque haya usuarios no encontr
 
 ## Resultados
 
-Con base de datos, el **estado actual** de cada cuenta queda en `bot.usuarios_traxion` (ver arriba). Además, en todos los casos, cada intento queda como una fila en la tabla `ejecuciones` de `resultados.db` (SQLite local), que sirve de historial:
+La **única fuente de verdad** es PostgreSQL: el estado actual de cada cuenta queda en `bot.usuarios_traxion` (columna `resultado` y su `status`, ver arriba). Los resultados posibles:
 
-| Estado | Significado |
+| Resultado | Significado |
 |---|---|
 | `OK` | Se guardó el monto |
 | `SIN_CAMBIOS` | Ya tenía el monto correcto, no se tocó |
 | `PRUEBA` | Se cargó el monto pero no se guardó (`GUARDAR=false`) |
 | `NO_ENCONTRADO` | La búsqueda devolvió "Datos: 0" |
+| `NO_COINCIDE` | La cuenta que mostró Traxion no es la del usuario buscado (ver "Validaciones"); no se toca nada |
 | `TIMEOUT_BUSQUEDA` | La búsqueda no respondió dentro de `TIMEOUT_BUSQUEDA_MS` |
 | `VARIAS_CUENTAS` | La búsqueda trajo más de una cuenta; no se toca nada |
-| `ERROR` | Otro problema (ver columna `detalle` y la carpeta `debug/`) |
+| `ERROR` | Otro problema (ver `status_message` y la carpeta `debug/`) |
 | `NO_PROCESADO` | El bot no llegó a procesarlo (no pudo volver a loguearse) |
-
-Columnas: `fecha`, `entorno`, `usuario_busqueda`, `cuenta_numero`, `cuenta_nombre`, `monto_anterior`, `monto_nuevo`, `guardado`, `estado`, `detalle`, `lote` (una corrida), `intento` (1, o 2 si fue reintento).
-
-Consultas útiles:
-
-```sql
--- Estado final de cada usuario de la última corrida
-SELECT usuario_busqueda, estado, detalle FROM ejecuciones
-WHERE id IN (SELECT MAX(id) FROM ejecuciones
-             WHERE lote = (SELECT MAX(lote) FROM ejecuciones)
-             GROUP BY usuario_busqueda);
-
--- Usuarios que no existen en la plataforma
-SELECT DISTINCT usuario_busqueda FROM ejecuciones WHERE estado = 'NO_ENCONTRADO';
-```
+| `OTRO_PROCESO` | Otra corrida tenía la cuenta reservada: no se tocó ni se registra (solo aparece en el log y en `/estado`) |
 
 Además:
-- `logs/bot_AAAAMMDD.log`: log de cada día (lo mismo que se ve en consola).
-- `debug/`: captura de pantalla + HTML de la página cada vez que un usuario termina en error.
+- `logs/bot_AAAAMMDD.log`: log de cada día, con el detalle de cada intento (cuenta, monto anterior y nuevo, resultado) y el resumen de cada lote. Los parámetros de sesión de Traxion (`_s`, `_k`) aparecen siempre como `REDACTADO`.
+- `debug/`: una **captura** de la página cada vez que una cuenta termina en error. El HTML solo se guarda con `DEBUG_HTML=true` (para desarrollar) y con la sesión tapada. Todo lo de `debug/` se borra solo a los `DEBUG_RETENCION_DIAS` días, porque las capturas pueden tener datos personales.
+
+### Validaciones antes de tocar una cuenta
+
+Antes de abrir el formulario, el bot exige que la cuenta sea la del usuario buscado. Si algo no coincide, la cuenta queda `FAILED` con resultado `NO_COINCIDE` y el detalle de qué esperaba y qué encontró:
+
+1. **La grilla es de esta búsqueda:** después de "Buscar", el filtro "Usuario" de la página nueva tiene que decir exactamente el usuario buscado. (Además, se comprobó que la búsqueda de Traxion es exacta y distingue mayúsculas.)
+2. **El usuario está en esa cuenta:** abre "Usuarios" de la cuenta (el ícono de la columna "Usuarios") y exige que el título sea de esa cuenta y que el usuario aparezca en la columna **"ID Usuario"** con el texto exacto. Esa pantalla muestra datos personales: el bot solo lee el título y esa columna. Después vuelve con "Volver" (si "Volver" no deja la grilla con la cuenta, repite la búsqueda).
+3. **El formulario es de esa cuenta:** antes de Aceptar, el "Número de Cuenta" del formulario tiene que ser el de la grilla.
+
+### Cierre de sesión
+
+Al terminar cada lote, y antes de cada re-login, el bot cierra la sesión en Traxion (menú del usuario → "Salir de plataforma" → "Salir"). Cerrar el navegador no alcanza: la sesión seguiría viva del lado de Traxion hasta vencer. Si no puede cerrarla (página trabada), lo avisa en el log y sigue.
 
 ## Boss y Worker (punto de entrada HTTP)
 
@@ -219,7 +235,7 @@ Si el puerto se expone fuera de la red interna, conviene ponerlo detrás de HTTP
 
 ## Correrlo programado en el servidor
 
-Alternativa al Boss/Worker, si se prefiere correrlo a horario fijo:
+Alternativa al Boss/Worker (o complemento: el candado de la base evita que se pisen), si se prefiere correrlo a horario fijo:
 
 Con `HEADLESS=true` en el `.env`, alcanza con ejecutar el script con el Python del entorno virtual:
 
@@ -241,17 +257,35 @@ La lógica del lote (re-login, reintentos, registro), sin navegador ni plataform
 python tests/test_orquestacion.py
 ```
 
+Las protecciones de seguridad: `_s`/`_k` tapados en logs, mensajes y HTML; debug sin HTML por defecto y con borrado automático; TLS obligatorio fuera de localhost:
+
+```bash
+python tests/test_seguridad.py
+```
+
+Las validaciones antes de Aceptar y el cierre de sesión, con un navegador real (headless) contra páginas que imitan a Traxion. Verifica la lógica; la prueba contra Traxion testing sigue siendo necesaria porque el HTML real puede diferir en detalles:
+
+```bash
+python tests/test_validaciones.py
+```
+
 El Boss/Worker HTTP (token, despierto/dormido, vuelta extra, errores), con el Worker simulado:
 
 ```bash
 python tests/test_servidor.py
 ```
 
-La parte de PostgreSQL: sincronización incremental, FK, cola con índice parcial y reintentos. El test **borra y recrea** las tablas en la base que le indiques, así que solo corre si esa base se llama `prueba*` o `test*`. Necesita una base vacía:
+La parte de PostgreSQL: sincronización incremental, FK, cola con índice parcial, reintentos, reserva por fila, candado (incluida la reconexión), vínculos con el mismo usuario de Traxion y **permisos mínimos** (corre el bot con un usuario creado por `sql/02` y verifica que la base le rechace `users`, otras columnas y la vista). El test **borra y recrea** las tablas en la base que le indiques (y un rol `traxion_bot_test`), así que solo corre si esa base se llama `prueba*` o `test*`. Necesita una base vacía:
 
 ```bash
 # variables TEST_DB_HOST, TEST_DB_PORT (default 5544), TEST_DB_NAME (default prueba_bot), TEST_DB_USER, TEST_DB_PASS
 python tests/test_fuente_db.py
+```
+
+Concurrencia con **procesos reales**: dos procesos llaman a la vez a `vaciar_cola()` (trabaja uno solo) y dos procesos compiten por las mismas filas salteándose el candado (cada cuenta la toma uno solo). Misma base de prueba:
+
+```bash
+python tests/test_concurrencia.py
 ```
 
 ## Cómo funciona (para mantenerlo)
@@ -263,6 +297,7 @@ python tests/test_fuente_db.py
 - **Monto crédito** usa una librería de formato numérico (autoNumeric): el bot tipea el valor tecla por tecla y sale del campo con Tab. **No usa Enter**, porque dispara un botón oculto del formulario.
 - **Captcha:** si la plataforma lo pide, el bot se frena y lo informa. No lo saltea.
 - **Base de datos:** toda la conexión pasa por la clase `BaseDatos` de `fuente_db.py`, un singleton con una única conexión que se arma desde el `.env`. Se conecta recién cuando se usa y se reconecta sola si se cayó. Las consultas van siempre con parámetros, nunca concatenando valores en el SQL, así que no hay riesgo de inyección.
+- **Conexión cifrada:** si la base no está en `localhost`, el bot exige TLS. Por defecto usa `sslmode=verify-full`, que cifra y comprueba el certificado del servidor; para AWS RDS, `DB_SSLROOTCERT` apunta al `global-bundle.pem` que publica Amazon. Con un modo que permita ir sin cifrar (`disable`, `allow`, `prefer`) contra una base remota, el bot no arranca. Por el canal viajan `DB_PASS` y los ids de cuenta.
 
 ## Pendiente
 

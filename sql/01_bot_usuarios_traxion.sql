@@ -1,8 +1,9 @@
 -- =============================================================================
 -- Tabla de trabajo del bot Traxion (esquema propio "bot", separado de "public")
 --
--- Las tablas de la aplicacion (public.linked_accounts, public.users) solo se LEEN;
--- el bot nunca las modifica. Todo lo que el bot escribe va al esquema "bot".
+-- El bot nunca modifica las tablas de la aplicacion. De public.linked_accounts lee solo 5 columnas
+-- (id, provider, status, external_user_id, created_at) y no lee public.users: ver 02_usuario_bot.sql.
+-- Todo lo que el bot escribe va al esquema "bot".
 --
 -- Ejecutar completo en DBeaver con Alt+X (Ejecutar script). Se puede correr mas
 -- de una vez sin romper nada.
@@ -32,17 +33,27 @@ CREATE TABLE IF NOT EXISTS bot.usuarios_traxion (
     importado_en      timestamptz NOT NULL DEFAULT now()
 );
 
+-- Reserva de la fila mientras una corrida la procesa (para que otro proceso no la tome a la vez).
+-- Se libera al guardar el resultado; si el proceso muere, vence sola (RECLAMO_VENCE_MIN).
+-- ADD COLUMN IF NOT EXISTS: correr este script de nuevo actualiza tablas creadas con versiones anteriores.
+ALTER TABLE bot.usuarios_traxion ADD COLUMN IF NOT EXISTS reclamado_en  timestamptz;
+ALTER TABLE bot.usuarios_traxion ADD COLUMN IF NOT EXISTS reclamado_por text;  -- maquina:pid:id de la corrida
+
 -- Cola de trabajo: indice PARCIAL, solo con las cuentas pendientes (status NULL).
 -- Las ya procesadas (SUCCESS / FAILED) no ocupan lugar en el indice.
 CREATE INDEX IF NOT EXISTS idx_usuarios_traxion_pendientes
     ON bot.usuarios_traxion (origen_creado_en, linked_account_id)
     WHERE status IS NULL;
 
--- Marca de agua (MAX) y actualizacion del resultado por usuario
+-- Marca de agua (MAX) y busquedas por usuario de Traxion (consultas manuales).
+-- usuario_traxion NO es unico: dos vinculos de Pago24 pueden apuntar al mismo usuario de Traxion.
+-- Por eso el bot reserva y guarda cada fila por su clave, linked_account_id.
 CREATE INDEX IF NOT EXISTS idx_usuarios_traxion_origen  ON bot.usuarios_traxion (origen_creado_en);
 CREATE INDEX IF NOT EXISTS idx_usuarios_traxion_usuario ON bot.usuarios_traxion (usuario_traxion);
 
--- Vista para consultar a simple vista: datos del bot + vinculo + comercio (join por la FK)
+-- Vista para CONSULTA HUMANA (DBeaver, Fede): datos del bot + vinculo + comercio (join por la FK).
+-- Lee public.users, por eso NO se le da al usuario del bot (ver 02_usuario_bot.sql): una vista se
+-- ejecuta con los permisos de su duenio, y daria al bot una via de acceso a users.
 CREATE OR REPLACE VIEW bot.v_usuarios_traxion AS
 SELECT b.usuario_traxion,
        u.commerce_name AS comercio,
@@ -55,7 +66,9 @@ SELECT b.usuario_traxion,
        b.monto_anterior,
        b.procesado_en,
        b.linked_account_id,
-       la.user_id
+       la.user_id,
+       b.reclamado_en,
+       b.reclamado_por
 FROM bot.usuarios_traxion b
 JOIN public.linked_accounts la ON la.id = b.linked_account_id
 LEFT JOIN public.users u      ON u.id  = la.user_id;
