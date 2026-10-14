@@ -3,3 +3,4 @@ debug/
 resultados.db
 __pycache__/
 logs/
+docs/
