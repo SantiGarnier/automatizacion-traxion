@@ -225,7 +225,14 @@ Mientras el Worker está despierto:
 - Cada cuenta se procesa **como máximo una vez por despertar**. Si una tiene una falla pasajera, queda en `NULL` para el próximo despertar. Si no fuera así, con Traxion caído el Worker reintentaría la misma cuenta en loop y nunca se dormiría. A los `MAX_INTENTOS` fallos pasa a `FAILED`.
 - Usa `GUARDAR` y `HEADLESS` del `.env`. En el servidor: `GUARDAR=true` y `HEADLESS=true`.
 
-Variables: `API_HOST` (`127.0.0.1` = solo la misma máquina; `0.0.0.0` = acepta llamadas de otras), `API_PORT` (default `8080`) y `API_TOKEN` (obligatorio, mínimo 16 caracteres). Para generar un token:
+**Vuelta inicial al arrancar:** al levantar el servidor, el Worker da una vuelta sin esperar un aviso. Así procesa lo que haya quedado pendiente mientras estuvo apagado: avisos del backend que se perdieron porque el bot estaba caído, y cuentas con una falla pasajera esperando reintento. Si no hay nada pendiente, termina enseguida y se duerme. Se desactiva con `DESPERTAR_AL_ARRANCAR=false`.
+
+**Cómo debe llamar el backend a `/despertar`:**
+- **Después del commit** de la transacción que crea la cuenta en `linked_accounts`. Si llama antes, el Worker puede sincronizar sin ver la cuenta nueva, y esta quedaría esperando hasta el próximo aviso.
+- **Sin bloquear el alta:** timeout corto (2-3 s) y, si el bot no responde, solo loguear. `/despertar` responde `202` enseguida y procesa en segundo plano.
+- Si no hay cron, lo que quede pendiente (por ejemplo, un reintento) se procesa en el próximo aviso o al reiniciar el servidor. Si hiciera falta un barrido periódico, se puede sumar un cron que llame a `/despertar`: el candado de la base evita que se pisen.
+
+Variables: `API_HOST` (`127.0.0.1` = solo la misma máquina; `0.0.0.0` = acepta llamadas de otras), `API_PORT` (default `8080`), `API_TOKEN` (obligatorio, mínimo 16 caracteres) y `DESPERTAR_AL_ARRANCAR` (default `true`). Para generar un token:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"

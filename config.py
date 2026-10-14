@@ -64,6 +64,9 @@ RECLAMO_VENCE_MIN = int(os.getenv("RECLAMO_VENCE_MIN", "30"))
 API_HOST = os.getenv("API_HOST", "127.0.0.1")  # 0.0.0.0 para aceptar llamadas desde otras maquinas
 API_PORT = int(os.getenv("API_PORT", "8080"))
 API_TOKEN = os.getenv("API_TOKEN", "")          # obligatorio: va en el header X-Token de cada llamada
+# Al arrancar el servidor, el Worker da una vuelta sin esperar aviso: procesa lo que quedo pendiente
+# mientras estuvo apagado (avisos perdidos, reintentos de fallas pasajeras)
+DESPERTAR_AL_ARRANCAR = _bool("DESPERTAR_AL_ARRANCAR", True)
 
 # Debug: ante un error se guarda una captura. El HTML de la pagina solo con DEBUG_HTML=true (para
 # desarrollar; igual se guarda con la sesion tapada). Todo lo de debug/ se borra a los N dias.

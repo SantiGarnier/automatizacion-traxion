@@ -116,4 +116,62 @@ esperar(lambda: llamar("GET", "/estado")[1]["estado"] == "dormido")
 assert llamar("GET", "/estado")[1]["ultima_vuelta"]["ok"] is True
 
 http.shutdown()
+
+# ---------------------------------------------------------------- vuelta inicial al arrancar
+# Directo: sin ningun aviso, el Worker da una vuelta; un aviso que llega mientras tanto suma UNA vuelta mas
+inicial = WorkerFalso()
+boss2 = servidor.Boss(inicial)
+servidor.vuelta_inicial(boss2)
+inicial.empezo.wait(5)
+assert boss2.despierto and inicial.llamadas == 1
+assert boss2.despertar_worker() is False, "un aviso durante la vuelta inicial no arranca otro Worker"
+inicial.soltar.set()
+esperar(lambda: inicial.llamadas == 2)
+inicial.soltar.set()
+esperar(lambda: not boss2.despierto)
+assert inicial.llamadas == 2
+
+
+# Arranque real de main(): con DESPERTAR_AL_ARRANCAR=true da la vuelta; con false, no.
+# (base y Worker falsos; serve_forever se corta enseguida como si se apretara Ctrl+C)
+class BaseFalsa:
+    def conexion(self):
+        return None
+
+    def cerrar(self):
+        pass
+
+
+def arrancar(despertar_al_arrancar):
+    creados = []
+
+    def worker_falso(guardar, headless):
+        w = WorkerFalso()
+        w.soltar.set()  # termina enseguida
+        creados.append(w)
+        return w
+
+    def cortar(self, *a, **k):
+        raise KeyboardInterrupt
+
+    originales = (servidor.Worker, servidor.fuente_db.BaseDatos, servidor.ThreadingHTTPServer.serve_forever)
+    servidor.Worker, servidor.fuente_db.BaseDatos = worker_falso, BaseFalsa
+    servidor.ThreadingHTTPServer.serve_forever = cortar
+    config.TRAXION_USER, config.TRAXION_PASS, config.DB_NAME = "u", "p", "prueba"
+    config.API_TOKEN, config.API_HOST, config.API_PORT = TOKEN, "127.0.0.1", 0
+    config.DESPERTAR_AL_ARRANCAR = despertar_al_arrancar
+    try:
+        assert servidor.main() == 0
+    finally:
+        servidor.Worker, servidor.fuente_db.BaseDatos, servidor.ThreadingHTTPServer.serve_forever = originales
+    w = creados[0]
+    if despertar_al_arrancar:
+        assert w.empezo.wait(5), "con DESPERTAR_AL_ARRANCAR=true tiene que dar la vuelta inicial"
+    else:
+        time.sleep(0.3)
+        assert w.llamadas == 0, "con DESPERTAR_AL_ARRANCAR=false no tiene que trabajar sin aviso"
+
+
+arrancar(True)
+arrancar(False)
 print("TEST SERVIDOR OK")

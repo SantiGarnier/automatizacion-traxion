@@ -155,8 +155,19 @@ def crear_handler(boss: Boss, token: str):
     return Handler
 
 
+def vuelta_inicial(boss: Boss) -> None:
+    """
+    Al arrancar, el Worker da una vuelta sin esperar un aviso. Cubre lo que quedo pendiente mientras el
+    servidor estuvo apagado: avisos del backend que se perdieron (el bot estaba caido) y cuentas con una
+    falla pasajera que esperan reintento. Si no hay nada pendiente, la vuelta termina enseguida.
+    Si justo llega un aviso mientras tanto, el Boss lo convierte en "una vuelta mas", como siempre.
+    """
+    log("Boss: vuelta inicial al arrancar (procesa lo que haya quedado pendiente)")
+    boss.despertar_worker()
+
+
 def main() -> int:
-    faltan = [n for n in ("TRAXION_USER", "TRAXION_PASS", "DB_NAME", "API_TOKEN") if not getattr(config, n)]
+    faltan =[n for n in ("TRAXION_USER", "TRAXION_PASS", "DB_NAME", "API_TOKEN") if not getattr(config, n)]
     if faltan:
         log(f"ERROR: faltan en el .env: {', '.join(faltan)}")
         return 1
@@ -179,6 +190,8 @@ def main() -> int:
     boss = Boss(Worker(guardar=config.GUARDAR, headless=config.HEADLESS))
     servidor = ThreadingHTTPServer((config.API_HOST, config.API_PORT), crear_handler(boss, config.API_TOKEN))
     log(f"Boss escuchando en http://{config.API_HOST}:{config.API_PORT} (Worker dormido)")
+    if config.DESPERTAR_AL_ARRANCAR:
+        vuelta_inicial(boss)
     try:
         servidor.serve_forever()
     except KeyboardInterrupt:
