@@ -40,6 +40,14 @@ document.addEventListener('click', ev => {
     dd.style.display = dd.style.display === 'none' ? 'block' : 'none';
     return;
   }
+  const toggle = ev.target.closest('.dropdown-toggle');
+  if (toggle) {                                     // desplegable estilo Bootstrap/Metronic
+    ev.preventDefault();
+    if (window.menuRoto) return;                    // los scripts del menu todavia no se engancharon
+    const m = toggle.parentElement.querySelector('.dropdown-menu');
+    m.style.display = m.style.display === 'none' ? 'block' : 'none';
+    return;
+  }
   const tab = ev.target.closest('li[role=tab]');
   if (tab) {                                        // pestañas jQuery UI
     ev.preventDefault();
@@ -52,6 +60,7 @@ document.addEventListener('click', ev => {
   const el = ev.target.closest('[data-ir]');
   if (!el) return;
   ev.preventDefault();
+  if (el.dataset.confirmar && !confirm(el.dataset.confirmar)) return;   // confirm() de JS
   setTimeout(() => {                                 // "respuesta AJAX"
     document.body.innerHTML = window.pantallas[el.dataset.ir];
     window.aplicarModo();
@@ -113,6 +122,36 @@ INICIO = """
     </ul>"""
 SALIR = """<h1>Desea cerrar la plataforma?</h1>
     <input type="submit" value="Salir" data-ir="login"> <input type="submit" value="No">"""
+
+
+def inicio_metronic(confirmar=""):
+    """
+    Encabezado como el del tema Metronic: el menu del usuario es un desplegable Bootstrap, y ANTES hay una
+    copia oculta de "Salir de plataforma" (menu para celular). Con confirmar=..., la salida se confirma con
+    un confirm() de JS en vez de una pantalla con boton "Salir".
+    """
+    destino = 'data-ir="login" data-confirmar="' + confirmar + '"' if confirmar else 'data-ir="salir"'
+    return f"""
+    <ul class="menu-celular" style="display:none"><li><a href="#" data-ir="salir">Salir de plataforma</a></li></ul>
+    <div style="display:none"><input type="submit" value="Salir"></div>
+    <ul class="nav navbar-nav pull-right">
+      <li class="dropdown dropdown-user">
+        <a href="javascript:;" class="dropdown-toggle" data-toggle="dropdown">
+          <span class="username">operador_prueba</span> <i class="fa fa-angle-down"></i></a>
+        <ul class="dropdown-menu" style="display:none">
+          <li>Usr: operador_prueba</li><li><a href="#" {destino}>Salir de plataforma</a></li>
+        </ul>
+      </li>
+    </ul>"""
+
+
+def probar_salida(page, html, menu_roto=False, pantallas=None):
+    page.set_content(f"<html><body>{html}</body></html>")
+    page.evaluate("([p, roto]) => { window.pantallas = p; window.menuRoto = roto; }",
+                  [pantallas or {"salir": SALIR, "login": LOGIN}, menu_roto])
+    page.evaluate(JS_NAVEGACION)
+    bot.cerrar_sesion_traxion(page, timeout=3000)
+    assert bot.es_pantalla_login(page), "despues de salir tiene que quedar en el login"
 
 
 def preparar(page, modo="cargada", filtro=U, **pantallas):
@@ -200,21 +239,33 @@ with sync_playwright() as p:
     print("ok  validacion 3: formulario de otra cuenta -> NO_COINCIDE")
 
     # Cierre de sesion: menu del usuario -> "Salir de plataforma" -> "Salir" -> login
-    page.set_content(f"<html><body>{INICIO}</body></html>")
-    page.evaluate("p => { window.pantallas = p; }", {"salir": SALIR, "login": LOGIN})
-    page.evaluate(JS_NAVEGACION)
-    bot.cerrar_sesion_traxion(page, timeout=5000)
-    assert bot.es_pantalla_login(page), "despues de salir tiene que quedar en el login"
+    probar_salida(page, INICIO)
     print("ok  cierre de sesion: menu -> Salir de plataforma -> Salir -> login")
 
+    # Encabezado Metronic con copias ocultas de "Salir de plataforma" y "Salir" antes de las visibles
+    probar_salida(page, inicio_metronic())
+    print("ok  cierre de sesion: ignora las copias ocultas (menu de celular) y usa el desplegable")
+
+    # El desplegable no se abre (sus scripts todavia no se engancharon): activa el link oculto directo
+    probar_salida(page, inicio_metronic(), menu_roto=True)
+    print("ok  cierre de sesion: si el menu no se despliega, activa 'Salir de plataforma' directo")
+
+    # La salida se confirma con un confirm() de JS (lo acepta el manejador de dialogos de la Sesion)
+    page.once("dialog", lambda d: d.accept())
+    probar_salida(page, inicio_metronic(confirmar="Desea cerrar la plataforma?"), pantallas={"login": LOGIN})
+    print("ok  cierre de sesion: confirmacion con confirm() de JS -> login sin buscar el boton")
+
     # Si la pagina ya esta en el login (sesion vencida) no hace nada; si esta trabada, no rompe nada
+    config.DEBUG_DIR = Path(tempfile.mkdtemp()) / "debug"
     bot.cerrar_sesion_traxion(page, timeout=1000)
     page.set_content("<html><body><p>pagina trabada, sin menu</p></body></html>")
-    bot.cerrar_sesion_traxion(page, timeout=1000)  # solo deja un AVISO en el log
+    bot.cerrar_sesion_traxion(page, timeout=1000)  # solo deja un AVISO en el log (con el paso y una captura)
+    assert len(list(config.DEBUG_DIR.glob("*logout*.png"))) == 1, "el aviso tiene que dejar una captura"
     print("ok  cierre de sesion: en el login o con la pagina trabada no rompe")
 
     browser.close()
 
 log = "".join(f.read_text(encoding="utf-8") for f in config.LOG_DIR.glob("*.log"))
 assert "Sesion de Traxion cerrada" in log and "no se pudo cerrar la sesion de Traxion" in log
+assert "en el paso" in log, "el aviso tiene que decir en que paso se trabo"
 print("TEST VALIDACIONES OK")

@@ -187,7 +187,7 @@ Antes de abrir el formulario, el bot exige que la cuenta sea la del usuario busc
 
 ### Cierre de sesión
 
-Al terminar cada lote, y antes de cada re-login, el bot cierra la sesión en Traxion (menú del usuario → "Salir de plataforma" → "Salir"). Cerrar el navegador no alcanza: la sesión seguiría viva del lado de Traxion hasta vencer. Si no puede cerrarla (página trabada), lo avisa en el log y sigue.
+Al terminar cada lote, y antes de cada re-login, el bot cierra la sesión en Traxion (menú del usuario → "Salir de plataforma" → "Salir"). Cerrar el navegador no alcanza: la sesión seguiría viva del lado de Traxion hasta vencer. Solo toma elementos visibles (la página puede tener copias ocultas del menú), y si el desplegable no se abre, activa "Salir de plataforma" directo. Si igual no puede cerrarla (página trabada), lo avisa en el log con el paso en que se trabó, guarda una captura en `debug/` y sigue.
 
 ## Boss y Worker (punto de entrada HTTP)
 

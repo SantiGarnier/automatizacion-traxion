@@ -119,7 +119,8 @@ _MARCA_ID = "__bot_marca"
 
 
 def click_y_esperar(page: Page, elemento, accion: str, timeout: int | None = None,
-                    error_cls: type[SinRespuesta] = SinRespuesta, chequear_sesion: bool = True) -> None:
+                    error_cls: type[SinRespuesta] = SinRespuesta, chequear_sesion: bool = True,
+                    directo: bool = False) -> None:
     """
     Clickea y espera a que la plataforma reemplace la pagina, por evento y no por tiempo:
       1. Antes del click se inserta un <div> marcador dentro del <body>.
@@ -129,6 +130,8 @@ def click_y_esperar(page: Page, elemento, accion: str, timeout: int | None = Non
     `timeout` es el tope: si se cumple sin respuesta se lanza `error_cls`.
     Por defecto es TIMEOUT_MS (tope de seguridad); la busqueda usa uno corto.
     Si la pagina nueva es el login, la sesion vencio -> SesionVencida.
+    directo=True dispara el click por JS sobre el elemento aunque no este visible (p. ej. un item de un
+    menu que no se desplego).
     """
     page.evaluate(
         "id => { const d = document.createElement('div'); d.id = id; d.hidden = true; document.body.appendChild(d); }",
@@ -142,7 +145,10 @@ def click_y_esperar(page: Page, elemento, accion: str, timeout: int | None = Non
 
     page.on("response", _capturar)
     try:
-        elemento.click()
+        if directo:
+            elemento.dispatch_event("click", timeout=timeout)
+        else:
+            elemento.click()
         page.wait_for_function(f"() => !document.getElementById('{_MARCA_ID}')", timeout=timeout)
     except PWTimeout:
         ms = timeout if timeout is not None else config.TIMEOUT_MS
@@ -281,27 +287,65 @@ def cerrar_sesion_traxion(page: Page, timeout: int = 15000) -> None:
     """
     Cierra la sesion en Traxion: menu del usuario (arriba a la derecha) -> "Salir de plataforma" -> "Salir".
     Cerrar el navegador NO alcanza: la sesion seguiria viva del lado de Traxion hasta vencer, y con sus
-    _s/_k alguien podria usarla. Es "best effort": si falla (pagina trabada), se avisa en el log y se sigue.
+    _s/_k alguien podria usarla. Es "best effort": si falla (pagina trabada), se avisa en el log (con el
+    paso en que se trabo y una captura en debug/) y se sigue.
+    Solo se usan elementos VISIBLES: la pagina puede tener copias ocultas (menu para celular) antes.
     """
+    paso = "revisar la pagina"
     try:
         if page.is_closed() or es_pantalla_login(page):
             return
-        salir_menu = page.get_by_text("Salir de plataforma", exact=True).first
-        if not salir_menu.is_visible():
-            usuario = re.compile(rf"^\s*{re.escape(config.TRAXION_USER)}\s*$")
-            page.locator("a", has_text=usuario).first.click(timeout=timeout)
-            salir_menu.wait_for(state="visible", timeout=timeout)
-        click_y_esperar(page, salir_menu, "Cerrar sesion (menu)", timeout=timeout, chequear_sesion=False)
-        confirmar = page.get_by_role("button", name="Salir", exact=True).or_(
-            page.get_by_role("link", name="Salir", exact=True)).first
-        confirmar.wait_for(state="visible", timeout=timeout)
-        click_y_esperar(page, confirmar, "Cerrar sesion (confirmar)", timeout=timeout, chequear_sesion=False)
+        salir_menu = page.get_by_text("Salir de plataforma", exact=True)
+        if not salir_menu.count():
+            raise BotError("la pagina no tiene el link 'Salir de plataforma'")
+        if not salir_menu.filter(visible=True).count():
+            paso = "abrir el menu del usuario"
+            abrir_menu_usuario(page, salir_menu, timeout)
+        paso = "Salir de plataforma"
+        if salir_menu.filter(visible=True).count():
+            click_y_esperar(page, salir_menu.filter(visible=True).first, "Cerrar sesion (menu)",
+                            timeout=timeout, chequear_sesion=False)
+        else:
+            # El desplegable no se abrio (p. ej. sus scripts todavia no se engancharon): el link igual esta
+            # en la pagina, oculto; se lo activa directo
+            log("  El menu del usuario no se desplego: se activa 'Salir de plataforma' directo")
+            click_y_esperar(page, salir_menu.first, "Cerrar sesion (menu)", timeout=timeout,
+                            chequear_sesion=False, directo=True)
+        if not es_pantalla_login(page):  # si la confirmacion fue un confirm() de JS, ya esta en el login
+            paso = "confirmar la salida"
+            confirmar = page.get_by_role("button", name="Salir", exact=True).or_(
+                page.get_by_role("link", name="Salir", exact=True)).filter(visible=True).first
+            confirmar.wait_for(state="visible", timeout=timeout)
+            click_y_esperar(page, confirmar, "Cerrar sesion (confirmar)", timeout=timeout, chequear_sesion=False)
         if es_pantalla_login(page):
             log("Sesion de Traxion cerrada")
         else:
             log("AVISO: se confirmo la salida de Traxion pero no aparecio el login")
     except Exception as e:  # noqa: BLE001 - cerrar sesion nunca debe tapar el resultado del lote
-        log(f"AVISO: no se pudo cerrar la sesion de Traxion ({str(e).splitlines()[0][:150]}); vence sola")
+        log(f"AVISO: no se pudo cerrar la sesion de Traxion en el paso '{paso}' "
+            f"({str(e).splitlines()[0][:150]}); vence sola")
+        if not page.is_closed():
+            guardar_debug(page, f"logout_error_{paso}")
+
+
+def abrir_menu_usuario(page: Page, salir_menu, timeout: int) -> None:
+    """
+    Despliega el menu donde esta "Salir de plataforma". Se clickea el boton del MISMO desplegable que
+    contiene ese link; si no se reconoce el desplegable, el link visible con el nombre del operador.
+    No lanza error si el menu no se abre: quien llama activa el link directo.
+    """
+    boton = page.locator(".dropdown", has=salir_menu).locator(
+        ".dropdown-toggle, [data-toggle='dropdown'], [data-bs-toggle='dropdown']").filter(visible=True)
+    if not boton.count():
+        usuario = re.compile(rf"^\s*{re.escape(config.TRAXION_USER)}\s*$")
+        boton = page.locator("a", has_text=usuario).filter(visible=True)
+    if not boton.count():
+        return
+    try:
+        boton.first.click(timeout=timeout)
+        salir_menu.filter(visible=True).first.wait_for(state="visible", timeout=min(timeout, 3000))
+    except PWTimeout:
+        pass
 
 
 # --------------------------------------------------------------------------- pasos
